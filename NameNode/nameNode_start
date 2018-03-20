@@ -1,0 +1,103 @@
+//入口
+public static void main(String argv[]) throws Exception {
+    if (DFSUtil.parseHelpArgument(argv, NameNode.USAGE, System.out, true)) {
+      System.exit(0);
+    }
+
+    try {
+      StringUtils.startupShutdownMessage(NameNode.class, argv, LOG);
+      NameNode namenode = createNameNode(argv, null);//（1）创建NameNode
+      if (namenode != null) {
+        namenode.join();//（2）将NameNode加入RPC server中
+      }
+    } catch (Throwable e) {
+      LOG.error("Failed to start namenode.", e);
+      terminate(1, e);
+    }
+}
+（1）
+ public static NameNode createNameNode(String argv[], Configuration conf)
+      throws IOException {
+    LOG.info("createNameNode " + Arrays.asList(argv));
+    if (conf == null)
+      conf = new HdfsConfiguration();
+    StartupOption startOpt = parseArguments(argv);
+    if (startOpt == null) {
+      printUsage(System.err);
+      return null;
+    }
+    setStartupOption(conf, startOpt);
+
+    switch (startOpt) {
+      case FORMAT: {
+        boolean aborted = format(conf, startOpt.getForceFormat(),
+            startOpt.getInteractiveFormat());
+        terminate(aborted ? 1 : 0);
+        return null; // avoid javac warning
+      }
+      case GENCLUSTERID: {
+        System.err.println("Generating new cluster id:");
+        System.out.println(NNStorage.newClusterID());
+        terminate(0);
+        return null;
+      }
+      case FINALIZE: {
+        System.err.println("Use of the argument '" + StartupOption.FINALIZE +
+            "' is no longer supported. To finalize an upgrade, start the NN " +
+            " and then run `hdfs dfsadmin -finalizeUpgrade'");
+        terminate(1);
+        return null; // avoid javac warning
+      }
+      case ROLLBACK: {
+        boolean aborted = doRollback(conf, true);
+        terminate(aborted ? 1 : 0);
+        return null; // avoid warning
+      }
+      case BOOTSTRAPSTANDBY: {
+        String toolArgs[] = Arrays.copyOfRange(argv, 1, argv.length);
+        int rc = BootstrapStandby.run(toolArgs, conf);
+        terminate(rc);
+        return null; // avoid warning
+      }
+      case INITIALIZESHAREDEDITS: {
+        boolean aborted = initializeSharedEdits(conf,
+            startOpt.getForceFormat(),
+            startOpt.getInteractiveFormat());
+        terminate(aborted ? 1 : 0);
+        return null; // avoid warning
+      }
+      case BACKUP:
+      case CHECKPOINT: {
+        NamenodeRole role = startOpt.toNodeRole();
+        DefaultMetricsSystem.initialize(role.toString().replace(" ", ""));
+        return new BackupNode(conf, role);
+      }
+      case RECOVER: {
+        NameNode.doRecovery(startOpt, conf);
+        return null;
+      }
+      case METADATAVERSION: {
+        printMetadataVersion(conf);
+        terminate(0);
+        return null; // avoid javac warning
+      }
+      case UPGRADEONLY: {
+        DefaultMetricsSystem.initialize("NameNode");
+        new NameNode(conf);
+        terminate(0);
+        return null;
+      }
+      default: {
+        DefaultMetricsSystem.initialize("NameNode");
+        return new NameNode(conf);
+      }
+    }
+  }
+  （2）
+  public void join() {
+    try {
+      rpcServer.join();
+    } catch (InterruptedException ie) {
+      LOG.info("Caught interrupted exception ", ie);
+    }
+  }
