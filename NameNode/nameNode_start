@@ -1,4 +1,4 @@
-//入口
+//启动入口
 public static void main(String argv[]) throws Exception {
     if (DFSUtil.parseHelpArgument(argv, NameNode.USAGE, System.out, true)) {
       System.exit(0);
