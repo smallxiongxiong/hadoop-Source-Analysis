@@ -1,0 +1,92 @@
+  //启动入口
+  public static void main(String args[]) {
+    if (DFSUtil.parseHelpArgument(args, DataNode.USAGE, System.out, true)) {
+      System.exit(0);
+    }
+    secureMain(args, null);//（1）安全启动
+  }
+（1）  
+public static void secureMain(String args[], SecureResources resources) {
+    int errorCode = 0;
+    try {
+      StringUtils.startupShutdownMessage(DataNode.class, args, LOG);//设置启动和关闭日志信息
+      DataNode datanode = createDataNode(args, null, resources);//（2）用于创建Datanode实例，并启动Datanode线程 
+      if (datanode != null) {
+        datanode.join();//（3）主线程等待datanode线程执行完成 
+      } else {
+        errorCode = 1;
+      }
+    } catch (Throwable e) {
+      LOG.fatal("Exception in secureMain", e);
+      terminate(1, e);
+    } finally {
+      // We need to terminate the process here because either shutdown was called
+      // or some disk related conditions like volumes tolerated or volumes required
+      // condition was not met. Also, In secure mode, control will go to Jsvc
+      // and Datanode process hangs if it does not exit.
+      LOG.warn("Exiting Datanode");
+      terminate(errorCode);
+    }
+  }
+（2）  
+public static DataNode createDataNode(String args[], Configuration conf,
+      SecureResources resources) throws IOException {
+    DataNode dn = instantiateDataNode(args, conf, resources);//（4）
+    if (dn != null) {
+      dn.runDatanodeDaemon();//（5）
+    }
+    return dn;
+  }
+（3）
+  void join() {
+    while (shouldRun) {
+      try {
+        blockPoolManager.joinAll();
+        if (blockPoolManager.getAllNamenodeThreads().size() == 0) {
+          shouldRun = false;
+        }
+        // Terminate if shutdown is complete or 2 seconds after all BPs
+        // are shutdown.
+        synchronized(this) {
+          wait(2000);
+        }
+      } catch (InterruptedException ex) {
+        LOG.warn("Received exception in Datanode#join: " + ex);
+      }
+    }
+  }
+  
+ （4）实例化DataNode结点 
+   public static DataNode instantiateDataNode(String args [], Configuration conf,
+      SecureResources resources) throws IOException {
+    if (conf == null)
+      conf = new HdfsConfiguration();
+    
+    if (args != null) {
+      // parse generic hadoop options
+      GenericOptionsParser hParser = new GenericOptionsParser(conf, args);
+      args = hParser.getRemainingArgs();
+    }
+    
+    if (!parseArguments(args, conf)) {
+      printUsage(System.err);
+      return null;
+    }
+    Collection<StorageLocation> dataLocations = getStorageLocations(conf);
+    UserGroupInformation.setConfiguration(conf);
+    SecurityUtil.login(conf, DFS_DATANODE_KEYTAB_FILE_KEY,
+        DFS_DATANODE_KERBEROS_PRINCIPAL_KEY);
+    return makeInstance(dataLocations, conf, resources);
+  }
+  （5）启动DataNode线程
+    public void runDatanodeDaemon() throws IOException {
+    blockPoolManager.startAll();
+
+    // start dataXceiveServer
+    dataXceiverServer.start();
+    if (localDataXceiverServer != null) {
+      localDataXceiverServer.start();
+    }
+    ipcServer.start();
+    startPlugins(conf);
+  }
