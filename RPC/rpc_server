@@ -1,0 +1,35 @@
+ /** An RPC Server. */
+  public abstract static class Server extends org.apache.hadoop.ipc.Server {//继承自org.apache.hadoop.ipc.Server
+   ...
+   }
+//RPC Server 实例化并启动
+NameNode的initialize方法中rpcServer = createRpcServer(conf);
+
+ protected NameNodeRpcServer createRpcServer(Configuration conf)
+      throws IOException {
+    return new NameNodeRpcServer(conf, this);
+  }
+public NameNodeRpcServer(Configuration conf, NameNode nn){
+  ...
+  this.serviceRpcServer = new RPC.Builder(conf)
+          .setProtocol(
+              org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolPB.class)
+          .setInstance(clientNNPbService)
+          .setBindAddress(bindHost)
+          .setPort(serviceRpcAddr.getPort()).setNumHandlers(serviceHandlerCount)
+          .setVerbose(false)
+          .setSecretManager(namesystem.getDelegationTokenSecretManager())
+          .build();
+          
+   ...
+   this.clientRpcServer = new RPC.Builder(conf)
+        .setProtocol(
+            org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolPB.class)
+        .setInstance(clientNNPbService).setBindAddress(bindHost)
+        .setPort(rpcAddr.getPort()).setNumHandlers(handlerCount)
+        .setVerbose(false)
+        .setSecretManager(namesystem.getDelegationTokenSecretManager()).build();
+}
+
+
+   
