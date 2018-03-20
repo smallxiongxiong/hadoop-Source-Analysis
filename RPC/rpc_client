@@ -1,0 +1,53 @@
+//RPC Client 
+（1）如何连接
+（2）发数据
+（3）收数据
+  public Writable call(RPC.RpcKind rpcKind, Writable rpcRequest,
+      ConnectionId remoteId, int serviceClass,
+      AtomicBoolean fallbackToSimpleAuth) throws IOException {
+    final Call call = createCall(rpcKind, rpcRequest);
+    Connection connection = getConnection(remoteId, call, serviceClass,
+      fallbackToSimpleAuth);//建立连接
+    try {
+      connection.sendRpcRequest(call);                 // 发请求
+    } catch (RejectedExecutionException e) {
+      throw new IOException("connection has been closed", e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn("interrupted waiting to send rpc request to server", e);
+      throw new IOException(e);
+    }
+
+    boolean interrupted = false;
+    synchronized (call) {
+      while (!call.done) {
+        try {
+          call.wait();                           // wait for the result
+        } catch (InterruptedException ie) {
+          // save the fact that we were interrupted
+          interrupted = true;
+        }
+      }
+
+      if (interrupted) {
+        // set the interrupt flag now that we are done waiting
+        Thread.currentThread().interrupt();
+      }
+
+      if (call.error != null) {
+        if (call.error instanceof RemoteException) {
+          call.error.fillInStackTrace();
+          throw call.error;
+        } else { // local exception
+          InetSocketAddress address = connection.getRemoteAddress();
+          throw NetUtils.wrapException(address.getHostName(),
+                  address.getPort(),
+                  NetUtils.getHostname(),
+                  0,
+                  call.error);
+        }
+      } else {
+        return call.getRpcResponse();//收响应
+      }
+    }
+  }
