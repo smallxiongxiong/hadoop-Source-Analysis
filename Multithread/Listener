@@ -1,0 +1,267 @@
+//Listener线程，当Server处于运行状态时，其负责监听来自客户端的连接，并使用Select模式处理Accept事件。
+
+ private class Listener extends Thread {
+    
+    private ServerSocketChannel acceptChannel = null; //the accept channel
+    private Selector selector = null; //非阻塞方式 selector
+    private Reader[] readers = null;
+    private int currentReader = 0;
+    private InetSocketAddress address; //the address we bind at
+    private int backlogLength = conf.getInt(
+        CommonConfigurationKeysPublic.IPC_SERVER_LISTEN_QUEUE_SIZE_KEY,
+        CommonConfigurationKeysPublic.IPC_SERVER_LISTEN_QUEUE_SIZE_DEFAULT);
+    
+    public Listener() throws IOException {
+      address = new InetSocketAddress(bindAddress, port);
+      // 创建一个socket并设置为非阻塞模式
+      acceptChannel = ServerSocketChannel.open();
+      acceptChannel.configureBlocking(false);
+
+      // Bind the server socket to the local host and port
+      bind(acceptChannel.socket(), address, backlogLength, conf, portRangeConfig);
+      port = acceptChannel.socket().getLocalPort(); //Could be an ephemeral port
+      // create a selector;一个selector可以等待多个socket
+      selector= Selector.open();
+      readers = new Reader[readThreads];
+      for (int i = 0; i < readThreads; i++) {
+        Reader reader = new Reader(
+            "Socket Reader #" + (i + 1) + " for port " + port);
+        readers[i] = reader;
+        reader.start();
+      }
+
+      // 将selector在accepts上进行注册，当有accept事件发生，selector就会被唤醒以处理全部的事件，处理事件是进行一个doAccept的调用
+      acceptChannel.register(selector, SelectionKey.OP_ACCEPT);
+      this.setName("IPC Server listener on " + port);
+      this.setDaemon(true);
+    }
+    
+    private class Reader extends Thread {
+      final private BlockingQueue<Connection> pendingConnections;
+      private final Selector readSelector;
+
+      Reader(String name) throws IOException {
+        super(name);
+
+        this.pendingConnections =
+            new LinkedBlockingQueue<Connection>(readerPendingConnectionQueue);
+        this.readSelector = Selector.open();
+      }
+      
+      @Override
+      public void run() {
+        LOG.info("Starting " + Thread.currentThread().getName());
+        try {
+          doRunLoop();
+        } finally {
+          try {
+            readSelector.close();
+          } catch (IOException ioe) {
+            LOG.error("Error closing read selector in " + Thread.currentThread().getName(), ioe);
+          }
+        }
+      }
+
+      private synchronized void doRunLoop() {
+        while (running) {
+          SelectionKey key = null;
+          try {
+            // consume as many connections as currently queued to avoid
+            // unbridled acceptance of connections that starves the select
+            int size = pendingConnections.size();
+            for (int i=size; i>0; i--) {//Reader线程尽可能多地处理缓冲队列中的连接，注册每一个连接的READ事件
+              Connection conn = pendingConnections.take();//取出一个连接，肯能阻塞
+              conn.channel.register(readSelector, SelectionKey.OP_READ, conn);//向select注册一个读事件
+            }
+            readSelector.select();//进行select，可能阻塞
+
+            Iterator<SelectionKey> iter = readSelector.selectedKeys().iterator();
+            while (iter.hasNext()) {
+              key = iter.next();
+              iter.remove();
+              if (key.isValid()) {
+                if (key.isReadable()) {
+                  doRead(key);
+                }
+              }
+              key = null;
+            }
+          } catch (InterruptedException e) {
+            if (running) {                      // unexpected -- log it
+              LOG.info(Thread.currentThread().getName() + " unexpectedly interrupted", e);
+            }
+          } catch (IOException ex) {
+            LOG.error("Error in Reader", ex);
+          }
+        }
+      }
+
+      /**
+       * Updating the readSelector while it's being used is not thread-safe,
+       * so the connection must be queued.  The reader will drain the queue
+       * and update its readSelector before performing the next select
+       */
+      public void addConnection(Connection conn) throws InterruptedException {
+        pendingConnections.put(conn);
+        readSelector.wakeup();
+      }
+
+      void shutdown() {
+        assert !running;
+        readSelector.wakeup();
+        try {
+          super.interrupt();
+          super.join();
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+
+    @Override
+    public void run() {
+      LOG.info(Thread.currentThread().getName() + ": starting");
+      SERVER.set(Server.this);
+      connectionManager.startIdleScan();
+      while (running) {
+        SelectionKey key = null;
+        try {
+          getSelector().select();
+          Iterator<SelectionKey> iter = getSelector().selectedKeys().iterator();
+          while (iter.hasNext()) {
+            key = iter.next();
+            iter.remove();
+            try {
+              if (key.isValid()) {
+                if (key.isAcceptable())
+                  doAccept(key);
+              }
+            } catch (IOException e) {
+            }
+            key = null;
+          }
+        } catch (OutOfMemoryError e) {
+          // we can run out of memory if we have too many threads
+          // log the event and sleep for a minute and give 
+          // some thread(s) a chance to finish
+          LOG.warn("Out of Memory in server select", e);
+          closeCurrentConnection(key, e);
+          connectionManager.closeIdle(true);
+          try { Thread.sleep(60000); } catch (Exception ie) {}
+        } catch (Exception e) {
+          closeCurrentConnection(key, e);
+        }
+      }
+      LOG.info("Stopping " + Thread.currentThread().getName());
+
+      synchronized (this) {
+        try {
+          acceptChannel.close();
+          selector.close();
+        } catch (IOException e) { }
+
+        selector= null;
+        acceptChannel= null;
+        
+        // close all connections
+        connectionManager.stopIdleScan();
+        connectionManager.closeAll();
+      }
+    }
+
+    private void closeCurrentConnection(SelectionKey key, Throwable e) {
+      if (key != null) {
+        Connection c = (Connection)key.attachment();
+        if (c != null) {
+          closeConnection(c);
+          c = null;
+        }
+      }
+    }
+
+    InetSocketAddress getAddress() {
+      return (InetSocketAddress)acceptChannel.socket().getLocalSocketAddress();
+    }
+    
+    void doAccept(SelectionKey key) throws InterruptedException, IOException,  OutOfMemoryError {
+      ServerSocketChannel server = (ServerSocketChannel) key.channel();
+      SocketChannel channel;
+      while ((channel = server.accept()) != null) {
+
+        channel.configureBlocking(false);
+        channel.socket().setTcpNoDelay(tcpNoDelay);
+        channel.socket().setKeepAlive(true);
+        
+        Reader reader = getReader();
+        Connection c = connectionManager.register(channel);
+        // If the connectionManager can't take it, close the connection.
+        if (c == null) {
+          if (channel.isOpen()) {
+            IOUtils.cleanup(null, channel);
+          }
+          continue;
+        }
+        key.attach(c);  // so closeCurrentConnection can get the object
+        reader.addConnection(c);
+      }
+    }
+
+    void doRead(SelectionKey key) throws InterruptedException {
+      int count = 0;
+      Connection c = (Connection)key.attachment();
+      if (c == null) {
+        return;  
+      }
+      c.setLastContact(Time.now());
+      
+      try {
+        count = c.readAndProcess();
+      } catch (InterruptedException ieo) {
+        LOG.info(Thread.currentThread().getName() + ": readAndProcess caught InterruptedException", ieo);
+        throw ieo;
+      } catch (Exception e) {
+        // a WrappedRpcServerException is an exception that has been sent
+        // to the client, so the stacktrace is unnecessary; any other
+        // exceptions are unexpected internal server errors and thus the
+        // stacktrace should be logged
+        LOG.info(Thread.currentThread().getName() + ": readAndProcess from client " +
+            c.getHostAddress() + " threw exception [" + e + "]",
+            (e instanceof WrappedRpcServerException) ? null : e);
+        count = -1; //so that the (count < 0) block is executed
+      }
+      if (count < 0) {
+        closeConnection(c);
+        c = null;
+      }
+      else {
+        c.setLastContact(Time.now());
+      }
+    }   
+
+    synchronized void doStop() {
+      if (selector != null) {
+        selector.wakeup();
+        Thread.yield();
+      }
+      if (acceptChannel != null) {
+        try {
+          acceptChannel.socket().close();
+        } catch (IOException e) {
+          LOG.info(Thread.currentThread().getName() + ":Exception in closing listener socket. " + e);
+        }
+      }
+      for (Reader r : readers) {
+        r.shutdown();
+      }
+    }
+    
+    synchronized Selector getSelector() { return selector; }
+    // The method that will return the next reader to work with
+    // Simplistic implementation of round robin for now
+    Reader getReader() {
+      currentReader = (currentReader + 1) % readers.length;
+      return readers[currentReader];
+    }
+  }
+
+  
